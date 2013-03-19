@@ -619,11 +619,14 @@ func (m *DbMap) AddTableWithName(i interface{}, name string) *TableMap {
 // This is particularly useful in unit tests where you want to create
 // and destroy the schema automatically.
 func (m *DbMap) CreateTables() error {
-	return m.CreateTablesOpts(false)
+	return m.CreateTablesOpts(false, false)
 }
 
-func (m *DbMap) CreateTablesOpts(ifNotExists bool) error {
+func (m *DbMap) CreateTablesOpts(ifNotExists bool, updateSchema bool) error {
 	var err error
+	if updateSchema {
+		ifNotExists = false
+	}
 	for i := range m.tables {
 		table := m.tables[i]
 
@@ -672,8 +675,58 @@ func (m *DbMap) CreateTablesOpts(ifNotExists bool) error {
 		s.WriteString(m.Dialect.CreateTableSuffix())
 		s.WriteString(";")
 		_, err = m.Exec(s.String())
-		if err != nil {
+		if err != nil && updateSchema {
+			var tblname string
+			if n, _ := fmt.Sscanf(err.Error(), "table %s already exists", &tblname); n == 1 {
+				err = m.updateTableSchema(table)
+				if err != nil {
+					break
+				}
+			} else {
+				break
+			}
+		} else if err != nil {
 			break
+		}
+	}
+	return err
+}
+
+func (m *DbMap) updateTableSchema(table *TableMap) error {
+	res, err := m.query("select * from " + table.TableName + " where 0")
+	if err != nil {
+		return err
+	}
+	existingColumns, err := res.Columns()
+	if err != nil {
+		return err
+	}
+	for _, col := range table.columns {
+		found := false
+		if col.Transient {
+			continue
+		}
+		for _, col2 := range existingColumns {
+			if col2 == col.ColumnName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			stype := m.Dialect.ToSqlType(col.gotype, col.MaxSize, col.isAutoIncr)
+			colname := m.Dialect.QuoteField(col.ColumnName)
+
+			stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table.TableName, colname, stype)
+			if col.Unique {
+				stmt = stmt + " unique"
+			}
+			if col.isAutoIncr {
+				stmt = stmt + fmt.Sprintf(" %s", m.Dialect.AutoIncrStr())
+			}
+			_, err = m.Exec(stmt)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return err
